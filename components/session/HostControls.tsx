@@ -18,6 +18,8 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
   const [key, setKey] = useState('C')
   const [uploading, setUploading] = useState(false)
   const [pushing, setPushing] = useState(false)
+  const [ocrRunning, setOcrRunning] = useState(false)
+  const [ocrPreview, setOcrPreview] = useState<{ content: string; detectedKey: string } | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   async function pushTextChart() {
@@ -44,15 +46,47 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
     const file = e.target.files?.[0]
     if (!file || !title.trim()) return
     setUploading(true)
+    setOcrPreview(null)
 
     const formData = new FormData()
     formData.append('file', file)
     formData.append('title', title.trim())
     formData.append('sessionId', sessionId)
 
-    const res = await fetch('/api/upload', { method: 'POST', body: formData })
-    const { url } = await res.json()
+    const uploadRes = await fetch('/api/upload', { method: 'POST', body: formData })
+    const { url } = await uploadRes.json()
 
+    // Run OCR immediately
+    setOcrRunning(true)
+    const ocrRes = await fetch('/api/ocr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageUrl: url }),
+    })
+    const ocrData = await ocrRes.json()
+    setOcrRunning(false)
+
+    if (ocrData.content) {
+      // OCR succeeded — offer to push as structured text chart (with modulation)
+      setOcrPreview({ content: ocrData.content, detectedKey: ocrData.detectedKey ?? 'C' })
+      setContent(ocrData.content)
+      setKey(ocrData.detectedKey ?? 'C')
+      setTab('text')
+    } else {
+      // OCR failed — push as image
+      const chart: ImageChart = { type: 'image', title: title.trim(), url }
+      await fetch(`/api/session/${sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'push_chart', chart }),
+      })
+      onChartUpdate(chart)
+    }
+    setUploading(false)
+    if (fileRef.current) fileRef.current.value = ''
+  }
+
+  async function pushImageAsRaw(url: string) {
     const chart: ImageChart = { type: 'image', title: title.trim(), url }
     await fetch(`/api/session/${sessionId}`, {
       method: 'POST',
@@ -60,7 +94,7 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
       body: JSON.stringify({ action: 'push_chart', chart }),
     })
     onChartUpdate(chart)
-    setUploading(false)
+    setOcrPreview(null)
   }
 
   async function changeKey(semitones: number) {
@@ -70,8 +104,8 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'change_key', semitones }),
     })
-    const { chart } = await res.json().catch(() => ({}))
-    if (chart) onChartUpdate(chart)
+    const data = await res.json()
+    if (data.chart) onChartUpdate(data.chart)
   }
 
   async function handleClear() {
@@ -85,16 +119,17 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
 
   const isTextChart = currentChart?.type === 'text'
   const currentSemitones = isTextChart ? (currentChart as TextChart).semitones : 0
+  const currentKey = isTextChart ? (currentChart as TextChart).key : ''
 
   return (
     <div className="space-y-4">
-      {/* Modulation bar — only shown when a text chart is active */}
+      {/* Modulation bar */}
       {isTextChart && (
         <div className="flex items-center gap-2 p-3 bg-zinc-800 rounded-xl">
           <span className="text-zinc-400 text-sm">Key:</span>
-          <span className="font-mono font-bold text-white text-lg w-8">{(currentChart as TextChart).key}</span>
+          <span className="font-mono font-bold text-white text-lg w-8">{currentKey}</span>
           <div className="flex gap-1 ml-auto">
-            {[-2, -1].map(s => (
+            {([-2, -1] as const).map(s => (
               <button
                 key={s}
                 onClick={() => changeKey(currentSemitones + s)}
@@ -109,7 +144,7 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
             >
               reset
             </button>
-            {[+1, +2].map(s => (
+            {([1, 2] as const).map(s => (
               <button
                 key={s}
                 onClick={() => changeKey(currentSemitones + s)}
@@ -119,6 +154,24 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
               </button>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* OCR success banner */}
+      {ocrPreview && (
+        <div className="bg-indigo-950 border border-indigo-500/40 rounded-xl p-3 text-sm">
+          <p className="text-indigo-300 font-medium mb-1">
+            AI read your chart — detected key: <span className="font-mono">{ocrPreview.detectedKey}</span>
+          </p>
+          <p className="text-indigo-400/80 text-xs mb-2">
+            Converted to text — you can now modulate the key. Push as text chart, or push the original image.
+          </p>
+          <button
+            onClick={() => setOcrPreview(null)}
+            className="text-xs text-indigo-400 underline"
+          >
+            Push as image instead
+          </button>
         </div>
       )}
 
@@ -178,13 +231,16 @@ export default function HostControls({ sessionId, currentChart, onChartUpdate, o
 
         {tab === 'image' && (
           <>
-            <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
+            <p className="text-xs text-zinc-500">
+              AI will auto-read the chart and convert it to text so you can modulate the key.
+            </p>
+            <input ref={fileRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleImageUpload} />
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={uploading || !title.trim()}
+              disabled={uploading || ocrRunning || !title.trim()}
               className="w-full py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-medium text-sm transition-colors"
             >
-              {uploading ? 'Uploading...' : 'Upload photo / scan'}
+              {ocrRunning ? 'AI reading chart...' : uploading ? 'Uploading...' : 'Upload photo / scan'}
             </button>
           </>
         )}
